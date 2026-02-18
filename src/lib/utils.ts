@@ -1,5 +1,9 @@
 import { browser } from '$app/environment';
 
+/**
+ * Default branches to always include in the tracking list.
+ * Includes unstable channels and the master branch.
+ */
 export const defaultBranches = [
 	'staging-next',
 	'master',
@@ -8,12 +12,22 @@ export const defaultBranches = [
 	'nixos-unstable'
 ];
 
+/**
+ * Stores the GitHub Personal Access Token (PAT) in the browser's local storage.
+ *
+ * @param token - The GitHub API token to store.
+ */
 export function setToken(token: string) {
 	if (browser) {
 		localStorage.setItem('token', token);
 	}
 }
 
+/**
+ * Retrieves the stored GitHub Personal Access Token from local storage.
+ *
+ * @returns The stored token or null if not found or not in a browser environment.
+ */
 function getToken() {
 	if (browser) {
 		return localStorage.getItem('token');
@@ -21,6 +35,14 @@ function getToken() {
 	return null;
 }
 
+/**
+ * Synchronizes the authentication token from the server-side session to the client-side storage.
+ *
+ * This bridge is necessary because the application makes direct client-side calls to the GitHub API
+ * to avoid bottling-necking the server and to leverage the user's own rate limits.
+ *
+ * It fetches the token from an internal API endpoint (`/api/auth/token`) and stores it if valid.
+ */
 export async function syncAuthToken() {
 	if (!browser) return;
 	try {
@@ -36,10 +58,21 @@ export async function syncAuthToken() {
 	}
 }
 
+/**
+ * Checks if a GitHub API token is currently stored and available for use.
+ *
+ * @returns True if a token exists, false otherwise.
+ */
 export function hasToken(): boolean {
 	return !!getToken();
 }
 
+/**
+ * Constructs the headers for GitHub API requests, including the Authorization header if a token is present.
+ *
+ * @param extraHeaders - Additional headers to include in the request.
+ * @returns A headers object ready for use in `fetch`.
+ */
 function header(extraHeaders: Record<string, string> = {}) {
 	const token = getToken();
 	const headers: Record<string, string> = { ...extraHeaders };
@@ -49,6 +82,16 @@ function header(extraHeaders: Record<string, string> = {}) {
 	return headers;
 }
 
+/**
+ * Fetches the list of active NixOS/nixpkgs branches to track.
+ *
+ * It retrieves all matching refs from the `nixos/nixpkgs` repository, filters for stable release branches
+ * (e.g., `nixos-23.11`, `nixpkgs-23.11`), sorts them by version, and takes the top 4 latest.
+ * These are then merged with the `defaultBranches` list.
+ *
+ * @returns A promise that resolves to an array of unique branch names.
+ *          Returns `defaultBranches` if the fetch fails.
+ */
 export async function getAllBranches(): Promise<string[]> {
 	const headers = header();
 	try {
@@ -61,8 +104,8 @@ export async function getAllBranches(): Promise<string[]> {
 			return defaultBranches;
 		}
 		const data = await response.json();
-		const nixosBranches = data
-			.map((b: any) => b.ref.replace('refs/heads/', ''))
+		const nixosBranches = (data as { ref: string }[])
+			.map((b) => b.ref.replace('refs/heads/', ''))
 			.filter((name: string) => /^(nixos|nixpkgs)-\d+\.\d+(-small|-darwin)?$/.test(name))
 			.sort((a: string, b: string) => b.localeCompare(a, undefined, { numeric: true }))
 			.slice(0, 4); // Get top 4 latest stable branches (2 nixos + 2 nixpkgs approx)
@@ -75,18 +118,27 @@ export async function getAllBranches(): Promise<string[]> {
 	}
 }
 
+/**
+ * Represents a GitHub user.
+ */
 export type User = {
 	login: string;
 	avatar_url: string;
 	html_url: string;
 };
 
+/**
+ * Represents a GitHub label.
+ */
 export type Label = {
 	name: string;
 	color: string;
 	description: string;
 };
 
+/**
+ * Represents the simplified details of a Pull Request used by the application.
+ */
 export type PR = {
 	title: string;
 	status: number;
@@ -102,6 +154,15 @@ export type PR = {
 	head_sha: string;
 };
 
+/**
+ * Fetches detailed information for a specific Pull Request from the GitHub API.
+ *
+ * Normalizes the raw GitHub API response into a simplified `PR` object for frontend consumption.
+ * Handles rate limiting and authentication errors by returning the status code in the PR object.
+ *
+ * @param pr - The Pull Request number or ID.
+ * @returns A promise resolving to the PR details.
+ */
 export async function getPR(pr: string): Promise<PR> {
 	const headers = header({
 		Accept: 'application/vnd.github.html+json'
@@ -128,6 +189,15 @@ export async function getPR(pr: string): Promise<PR> {
 	};
 }
 
+/**
+ * Fetches the list of users who have approved a specific Pull Request.
+ *
+ * It retrieves all reviews for the PR, filters for those with the 'APPROVED' state,
+ * and deduplicates the users (since a user might approve multiple times).
+ *
+ * @param pr - The Pull Request number.
+ * @returns A promise resolving to an array of unique `User` objects who approved the PR.
+ */
 export async function getReviews(pr: string): Promise<User[]> {
 	const headers = header();
 	const response = await fetch(`https://api.github.com/repos/nixos/nixpkgs/pulls/${pr}/reviews`, {
@@ -138,7 +208,7 @@ export async function getReviews(pr: string): Promise<User[]> {
 
 	// Filter for approved and deduplicate users
 	const approvers = new Map<string, User>();
-	data.forEach((review: any) => {
+	(data as { state: string; user: User }[]).forEach((review) => {
 		if (review.state === 'APPROVED') {
 			approvers.set(review.user.login, review.user);
 		}
@@ -147,6 +217,9 @@ export async function getReviews(pr: string): Promise<User[]> {
 	return Array.from(approvers.values());
 }
 
+/**
+ * Represents the status of a Continuous Integration (CI) check.
+ */
 export type CIStatus = {
 	id: string;
 	name: string;
@@ -155,6 +228,18 @@ export type CIStatus = {
 	description: string;
 };
 
+/**
+ * Aggregates detailed CI status information for a specific commit.
+ *
+ * Fetches data from two GitHub API endpoints:
+ * 1. `statuses`: Legacy commit statuses (e.g., OfBorg).
+ * 2. `check-runs`: GitHub Actions check runs.
+ *
+ * It deduplicates statuses by context/name and normalizes the state values.
+ *
+ * @param sha - The commit SHA to fetch status for.
+ * @returns A promise resolving to a list of `CIStatus` objects.
+ */
 export async function getDetailedCIStatus(sha: string): Promise<CIStatus[]> {
 	const headers = header();
 
@@ -212,6 +297,19 @@ export async function getDetailedCIStatus(sha: string): Promise<CIStatus[]> {
 	return ciStatuses;
 }
 
+/**
+ * Checks if a specific commit is contained within a branch's history.
+ *
+ * Uses the GitHub Compare API to check the relationship between the branch and the commit.
+ * Returns `true` if the API reports the status as 'identical' (same commit) or 'behind'.
+ *
+ * Note: A status of 'behind' for `branch...commit` means the `commit` is an ancestor of the `branch` tip,
+ * effectively meaning the commit is merged into the branch.
+ *
+ * @param branch - The name of the branch to check.
+ * @param commit - The SHA of the commit (usually the merge commit of a PR).
+ * @returns A promise resolving to `true` if the commit is in the branch, `false` otherwise.
+ */
 export async function isContain(branch: string, commit: string): Promise<boolean> {
 	const headers = header();
 	const url = `https://api.github.com/repos/nixos/nixpkgs/compare/${branch}...${commit}`;
@@ -223,12 +321,20 @@ export async function isContain(branch: string, commit: string): Promise<boolean
 	return data.status === 'identical' || data.status === 'behind';
 }
 
+/**
+ * Represents a history item for a tracked PR.
+ */
 export type History = {
 	pr: number;
 	title: string;
 	mergeCommit: string;
 };
 
+/**
+ * Retrieves the user's PR tracking history from local storage.
+ *
+ * @returns An array of `History` items, or an empty array if none exist or not in a browser.
+ */
 export function getHistoryList(): History[] {
 	if (!browser) return [];
 	const history = localStorage.getItem('history');
@@ -238,6 +344,13 @@ export function getHistoryList(): History[] {
 	return [];
 }
 
+/**
+ * Saves a PR to the user's tracking history in local storage.
+ *
+ * Checks for duplicates before adding to ensure each PR is only listed once.
+ *
+ * @param history - The history item to save.
+ */
 export function saveHistory(history: History) {
 	if (!browser) return;
 	const historyList = getHistoryList();
@@ -248,6 +361,12 @@ export function saveHistory(history: History) {
 	}
 }
 
+/**
+ * Retrieves the title of a PR from the local history given its number.
+ *
+ * @param pr - The PR number.
+ * @returns The title of the PR if found in history, otherwise an empty string.
+ */
 export function getHistoryTitle(pr: number): string {
 	const history = getHistoryList();
 	const item = history.find((item) => item.pr === pr);
@@ -257,6 +376,11 @@ export function getHistoryTitle(pr: number): string {
 	return '';
 }
 
+/**
+ * Removes a specific PR from the user's tracking history.
+ *
+ * @param pr - The PR number to remove.
+ */
 export function deleteHistory(pr: number) {
 	if (!browser) return;
 	const history = getHistoryList();
